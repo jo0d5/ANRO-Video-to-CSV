@@ -850,7 +850,35 @@ def getSampleIndices(totalFrames: int, fps: float, sampleFps) -> list:
 
 sampleIndices = getSampleIndices(totalFrames, fps, sampleFpsConst)
 
-dataRows, errors = [], []
+import tempfile
+errors = []
+
+_streamCols = ["timestamp"]
+for _k, _c in regions.items():
+    if not (_c[0] == _c[1] == _c[2] == _c[3] == 0):
+        _streamCols += [_k, f"_raw_{_k}", f"_conf_{_k}"]
+_seenCol = set()
+_streamCols = [c for c in _streamCols if not (c in _seenCol or _seenCol.add(c))]
+_rawCols = ["timestamp"] + [c for c in _streamCols if c in regions]
+
+_streamFd, cleanedStreamPath = tempfile.mkstemp(suffix="_rows.csv")
+os.close(_streamFd)
+_rawStreamFd, rawStreamPath = tempfile.mkstemp(suffix="_rawrows.csv")
+os.close(_rawStreamFd)
+
+rowBuf, rawBuf = [], []
+streamChunk = 2000
+_streamState = {"rows": False, "raw": False}
+
+def _flushBuf(buf, path, cols, stateKey):
+    if not buf:
+        return
+    pd.DataFrame(buf).reindex(columns=cols).to_csv(
+        path, index=False, mode="a", header=not _streamState[stateKey]
+    )
+    _streamState[stateKey] = True
+    buf.clear()
+
 lastOk = {
     "temperature": None,
     "pressure": None,
@@ -1388,13 +1416,16 @@ for frameIdx, frame in tqdm(
         except Exception as dbgE:
             errors.append(f"Frame {frameIdx}: overlay save failed: {dbgE}")
 
-    dataRows.append(row)
-    # Also accumulate a raw (no smoothing/interpolation) row for export
-    if 'raw_rows' not in globals():
-        rawRows = []
-    rawRows.append(rawVals)
+    rowBuf.append(row)
+    rawBuf.append(rawVals)
+    if len(rowBuf) >= streamChunk:
+        _flushBuf(rowBuf, cleanedStreamPath, _streamCols, "rows")
+        _flushBuf(rawBuf, rawStreamPath, _rawCols, "raw")
 
 cap.release()
+
+_flushBuf(rowBuf, cleanedStreamPath, _streamCols, "rows")
+_flushBuf(rawBuf, rawStreamPath, _rawCols, "raw")
 
 # --- Log errors ---
 if errors:
@@ -1403,7 +1434,10 @@ if errors:
     print(f"\n{len(errors)} OCR errors logged to {errorLog}")
 
 # --- Data Cleanup ---
-df = pd.DataFrame(dataRows)
+if _streamState["rows"]:
+    df = pd.read_csv(cleanedStreamPath)
+else:
+    df = pd.DataFrame(columns=_streamCols)
 for col in [
     "temperature",
     "pressure",
@@ -1506,8 +1540,8 @@ print(f"\nCleaned data saved to {outputPath}")
 # --- Save Raw Data (no smoothing/interpolation) ---
 rawOutputPath = None
 try:
-    if 'raw_rows' in globals() and rawRows:
-        dfRaw = pd.DataFrame(rawRows)
+    if _streamState["raw"]:
+        dfRaw = pd.read_csv(rawStreamPath)
         for col in [
             "temperature",
             "pressure",
@@ -1663,3 +1697,10 @@ try:
         print("Note: featuresBuilder.py not found; skipping features build.")
 except Exception as e:
     print(f"Warning: failed to run features builder: {e}")
+
+for _p in (cleanedStreamPath, rawStreamPath):
+    try:
+        if _p and os.path.isfile(_p):
+            os.remove(_p)
+    except Exception:
+        pass
